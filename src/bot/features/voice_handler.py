@@ -1,4 +1,4 @@
-"""Handle voice message transcription via Mistral (Voxtral), OpenAI (Whisper), or local whisper.cpp."""
+"""Handle voice message transcription via Deepgram, Mistral (Voxtral), OpenAI (Whisper), or local whisper.cpp."""
 
 import asyncio
 import shutil
@@ -15,6 +15,9 @@ from src.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
+DEEPGRAM_API_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_REQUEST_TIMEOUT: int = 60
+
 
 @dataclass
 class ProcessedVoice:
@@ -26,7 +29,7 @@ class ProcessedVoice:
 
 
 class VoiceHandler:
-    """Transcribe Telegram voice messages using Mistral, OpenAI, or local whisper.cpp."""
+    """Transcribe Telegram voice messages using Deepgram, Mistral, OpenAI, or local whisper.cpp."""
 
     # Timeout (seconds) for ffmpeg and whisper.cpp subprocess calls.
     LOCAL_SUBPROCESS_TIMEOUT: int = 120
@@ -35,6 +38,7 @@ class VoiceHandler:
         self.config = config
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
+        self._deepgram_session: Optional[Any] = None
         self._resolved_whisper_binary: Optional[str] = None
 
     def _ensure_allowed_file_size(self, file_size: Optional[int]) -> None:
@@ -91,6 +95,8 @@ class VoiceHandler:
             transcription = await self._transcribe_local(voice_bytes)
         elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
+        elif self.config.voice_provider == "deepgram":
+            transcription = await self._transcribe_deepgram(voice_bytes)
         else:
             transcription = await self._transcribe_mistral(voice_bytes)
 
@@ -201,6 +207,100 @@ class VoiceHandler:
 
         self._openai_client = AsyncOpenAI(api_key=api_key)
         return self._openai_client
+
+    # -- Deepgram provider --
+
+    async def _transcribe_deepgram(self, voice_bytes: bytes) -> str:
+        """Transcribe audio using the Deepgram REST API.
+
+        Sends raw OGG/Opus bytes from Telegram directly to /v1/listen.
+        Auth via 'Authorization: Token <key>'. No SDK dependency — uses aiohttp.
+        """
+        api_key = self.config.deepgram_api_key_str
+        if not api_key:
+            raise RuntimeError("Deepgram API key is not configured.")
+
+        session = await self._get_deepgram_session()
+
+        params = {
+            "model": self.config.resolved_voice_model,
+            "smart_format": "true",
+            "punctuate": "true",
+        }
+        language = self.config.deepgram_language
+        if language and language.lower() != "auto":
+            params["language"] = language
+        else:
+            params["detect_language"] = "true"
+
+        headers = {
+            "Authorization": f"Token {api_key}",
+            "Content-Type": "audio/ogg",
+        }
+
+        try:
+            async with session.post(
+                DEEPGRAM_API_URL,
+                params=params,
+                data=voice_bytes,
+                headers=headers,
+                timeout=DEEPGRAM_REQUEST_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    logger.warning(
+                        "Deepgram transcription returned non-200",
+                        status=resp.status,
+                        body=body,
+                    )
+                    raise RuntimeError(
+                        f"Deepgram transcription failed (HTTP {resp.status})."
+                    )
+                payload = await resp.json()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Deepgram transcription request failed",
+                error_type=type(exc).__name__,
+            )
+            raise RuntimeError("Deepgram transcription request failed.") from exc
+
+        try:
+            text = (
+                payload["results"]["channels"][0]["alternatives"][0]["transcript"] or ""
+            ).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                "Deepgram returned an unexpected response shape."
+            ) from exc
+
+        if not text:
+            raise ValueError("Deepgram transcription returned an empty response.")
+        return text
+
+    async def _get_deepgram_session(self) -> Any:
+        """Create and cache an aiohttp session on first use."""
+        if self._deepgram_session is not None and not self._deepgram_session.closed:
+            return self._deepgram_session
+
+        try:
+            import aiohttp
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Optional dependency 'aiohttp' is missing for Deepgram transcription. "
+                "Install voice extras: "
+                'pip install "claude-code-telegram[voice]"'
+            ) from exc
+
+        self._deepgram_session = aiohttp.ClientSession()
+        return self._deepgram_session
+
+    async def aclose(self) -> None:
+        """Close any background HTTP sessions (Deepgram)."""
+        if self._deepgram_session is not None and not self._deepgram_session.closed:
+            await self._deepgram_session.close()
+        self._deepgram_session = None
 
     # -- Local whisper.cpp provider --
 

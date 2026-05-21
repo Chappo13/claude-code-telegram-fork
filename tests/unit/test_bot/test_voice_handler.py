@@ -531,3 +531,87 @@ async def test_transcribe_local_whisper_nonzero_exit(local_voice_handler):
     ):
         with pytest.raises(RuntimeError, match="transcription failed"):
             await local_voice_handler._transcribe_local(b"fake-ogg")
+
+
+# --- Deepgram provider tests ---
+
+
+@pytest.fixture
+def deepgram_config():
+    """Create a mock config for Deepgram provider."""
+    cfg = MagicMock()
+    cfg.voice_provider = "deepgram"
+    cfg.deepgram_api_key_str = "test-deepgram-key"
+    cfg.deepgram_language = "auto"
+    cfg.resolved_voice_model = "nova-2"
+    cfg.voice_max_file_size_mb = 20
+    cfg.voice_max_file_size_bytes = 20 * 1024 * 1024
+    return cfg
+
+
+@pytest.fixture
+def deepgram_voice_handler(deepgram_config):
+    """Create a VoiceHandler instance with Deepgram config."""
+    return VoiceHandler(config=deepgram_config)
+
+
+def _mock_deepgram_session(payload, status=200):
+    """Build a mocked aiohttp ClientSession.post(...) async-context."""
+    resp = MagicMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=payload)
+    resp.text = AsyncMock(return_value=str(payload))
+
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=resp)
+    ctx.__aexit__ = AsyncMock(return_value=None)
+
+    session = MagicMock()
+    session.closed = False
+    session.post = MagicMock(return_value=ctx)
+    return session
+
+
+async def test_transcribe_deepgram_success(deepgram_voice_handler):
+    """Deepgram returns expected transcript and we strip whitespace."""
+    payload = {
+        "results": {
+            "channels": [
+                {"alternatives": [{"transcript": "  Hello from Deepgram.  "}]}
+            ]
+        }
+    }
+    deepgram_voice_handler._deepgram_session = _mock_deepgram_session(payload)
+
+    text = await deepgram_voice_handler._transcribe_deepgram(b"fake-ogg")
+
+    assert text == "Hello from Deepgram."
+
+
+async def test_transcribe_deepgram_empty_response(deepgram_voice_handler):
+    """Empty transcript raises ValueError."""
+    payload = {
+        "results": {"channels": [{"alternatives": [{"transcript": ""}]}]}
+    }
+    deepgram_voice_handler._deepgram_session = _mock_deepgram_session(payload)
+
+    with pytest.raises(ValueError, match="empty response"):
+        await deepgram_voice_handler._transcribe_deepgram(b"fake-ogg")
+
+
+async def test_transcribe_deepgram_http_error(deepgram_voice_handler):
+    """Non-200 HTTP status raises RuntimeError."""
+    deepgram_voice_handler._deepgram_session = _mock_deepgram_session(
+        {"error": "bad"}, status=401
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        await deepgram_voice_handler._transcribe_deepgram(b"fake-ogg")
+
+
+async def test_transcribe_deepgram_missing_key(deepgram_voice_handler):
+    """Missing API key raises RuntimeError before HTTP call."""
+    deepgram_voice_handler.config.deepgram_api_key_str = None
+
+    with pytest.raises(RuntimeError, match="API key is not configured"):
+        await deepgram_voice_handler._transcribe_deepgram(b"fake-ogg")

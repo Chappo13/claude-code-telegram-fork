@@ -201,9 +201,11 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai", "local"] = Field(
+    voice_provider: Literal["mistral", "openai", "local", "deepgram"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral', 'openai', or 'local'",
+        description=(
+            "Voice transcription provider: 'mistral', 'openai', 'local', or 'deepgram'"
+        ),
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -211,11 +213,21 @@ class Settings(BaseSettings):
     openai_api_key: Optional[SecretStr] = Field(
         None, description="OpenAI API key for Whisper voice transcription"
     )
+    deepgram_api_key: Optional[SecretStr] = Field(
+        None, description="Deepgram API key for voice transcription"
+    )
+    deepgram_language: Optional[str] = Field(
+        "auto",
+        description=(
+            "Deepgram language code (e.g. 'en', 'ru'). Use 'auto' to enable "
+            "detect_language. Default 'auto'."
+        ),
+    )
     voice_transcription_model: Optional[str] = Field(
         None,
         description=(
-            "Model for voice transcription. "
-            "Defaults to 'voxtral-mini-latest' (Mistral) or 'whisper-1' (OpenAI)"
+            "Model for voice transcription. Defaults: 'voxtral-mini-latest' "
+            "(Mistral), 'whisper-1' (OpenAI), 'nova-2' (Deepgram)"
         ),
     )
     voice_max_file_size_mb: int = Field(
@@ -442,9 +454,10 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai", "local"}:
+        if provider not in {"mistral", "openai", "local", "deepgram"}:
             raise ValueError(
-                "voice_provider must be one of ['mistral', 'openai', 'local']"
+                "voice_provider must be one of "
+                "['mistral', 'openai', 'local', 'deepgram']"
             )
         return provider
 
@@ -546,6 +559,13 @@ class Settings(BaseSettings):
         return self.openai_api_key.get_secret_value() if self.openai_api_key else None
 
     @property
+    def deepgram_api_key_str(self) -> Optional[str]:
+        """Get Deepgram API key as string."""
+        return (
+            self.deepgram_api_key.get_secret_value() if self.deepgram_api_key else None
+        )
+
+    @property
     def resolved_voice_model(self) -> str:
         """Get the voice transcription model, with provider-specific defaults."""
         if self.voice_transcription_model:
@@ -554,6 +574,8 @@ class Settings(BaseSettings):
             return "whisper-1"
         if self.voice_provider == "local":
             return self.whisper_cpp_model_path or "base"
+        if self.voice_provider == "deepgram":
+            return "nova-2"
         return "voxtral-mini-latest"
 
     @property
@@ -568,6 +590,8 @@ class Settings(BaseSettings):
             return "OPENAI_API_KEY"
         if self.voice_provider == "local":
             return ""
+        if self.voice_provider == "deepgram":
+            return "DEEPGRAM_API_KEY"
         return "MISTRAL_API_KEY"
 
     @property
@@ -577,6 +601,8 @@ class Settings(BaseSettings):
             return "OpenAI Whisper"
         if self.voice_provider == "local":
             return "Local whisper.cpp"
+        if self.voice_provider == "deepgram":
+            return "Deepgram Nova"
         return "Mistral Voxtral"
 
     @property
