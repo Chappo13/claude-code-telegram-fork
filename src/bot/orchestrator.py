@@ -344,7 +344,7 @@ class MessageOrchestrator:
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
         if self.settings.partner_mode:
-            hidden = {"projects", "restart"}
+            hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose"}
             handlers = [(c, h) for c, h in handlers if c not in hidden]
 
         # Derive known commands dynamically — avoids drift when new commands are added
@@ -501,7 +501,7 @@ class MessageOrchestrator:
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
             if self.settings.partner_mode:
-                hidden = {"projects", "restart", "repo"}
+                hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose"}
                 commands = [c for c in commands if c.command not in hidden]
             return commands
         else:
@@ -576,20 +576,6 @@ class MessageOrchestrator:
         if self.settings.partner_mode:
             keyboard = InlineKeyboardMarkup(
                 [
-                    [
-                        InlineKeyboardButton(
-                            "📊 Статус", callback_data="menu:status"
-                        ),
-                        InlineKeyboardButton(
-                            "💰 Расход", callback_data="menu:cost"
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
-                        InlineKeyboardButton(
-                            "⚙️ Настройки", callback_data="menu:settings"
-                        ),
-                    ],
                     [
                         InlineKeyboardButton(
                             "🆕 Новая сессия", callback_data="menu:new"
