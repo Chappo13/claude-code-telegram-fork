@@ -343,6 +343,9 @@ class MessageOrchestrator:
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
+        if self.settings.partner_mode:
+            hidden = {"projects", "restart"}
+            handlers = [(c, h) for c, h in handlers if c not in hidden]
 
         # Derive known commands dynamically — avoids drift when new commands are added
         self._known_commands: frozenset[str] = frozenset(cmd for cmd, _ in handlers)
@@ -497,6 +500,9 @@ class MessageOrchestrator:
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
+            if self.settings.partner_mode:
+                hidden = {"projects", "restart", "repo"}
+                commands = [c for c in commands if c.command not in hidden]
             return commands
         else:
             commands = [
@@ -567,26 +573,57 @@ class MessageOrchestrator:
 
         safe_name = escape_html(user.first_name)
         ro_badge = " · 🔒 read-only" if self.settings.read_only_mode else ""
-        keyboard = InlineKeyboardMarkup(
-            [
+        if self.settings.partner_mode:
+            keyboard = InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton("📁 Проекты", callback_data="menu:projects"),
-                    InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
-                ],
+                    [
+                        InlineKeyboardButton(
+                            "📊 Статус", callback_data="menu:status"
+                        ),
+                        InlineKeyboardButton(
+                            "💰 Расход", callback_data="menu:cost"
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
+                        InlineKeyboardButton(
+                            "⚙️ Настройки", callback_data="menu:settings"
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🆕 Новая сессия", callback_data="menu:new"
+                        ),
+                    ],
+                ]
+            )
+        else:
+            keyboard = InlineKeyboardMarkup(
                 [
-                    InlineKeyboardButton("💰 Расход", callback_data="menu:cost"),
-                    InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⚙️ Настройки", callback_data="menu:settings"
-                    ),
-                    InlineKeyboardButton(
-                        "🆕 Новая сессия", callback_data="menu:new"
-                    ),
-                ],
-            ]
-        )
+                    [
+                        InlineKeyboardButton(
+                            "📁 Проекты", callback_data="menu:projects"
+                        ),
+                        InlineKeyboardButton(
+                            "📊 Статус", callback_data="menu:status"
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "💰 Расход", callback_data="menu:cost"
+                        ),
+                        InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⚙️ Настройки", callback_data="menu:settings"
+                        ),
+                        InlineKeyboardButton(
+                            "🆕 Новая сессия", callback_data="menu:new"
+                        ),
+                    ],
+                ]
+            )
 
         welcome_text: Optional[str] = None
         wmf = self.settings.welcome_message_file

@@ -275,6 +275,14 @@ class Settings(BaseSettings):
             "Useful for partner deployments that need a tailored onboarding."
         ),
     )
+    partner_mode: bool = Field(
+        False,
+        description=(
+            "Slim UI for partner deployments tied to a single project: hides "
+            "the Projects menu button, the /projects command, and the "
+            "/restart command. The bot still operates inside APPROVED_DIRECTORY."
+        ),
+    )
 
     # Reply quoting
     reply_quote: bool = Field(
