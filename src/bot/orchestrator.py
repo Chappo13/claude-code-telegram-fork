@@ -337,6 +337,7 @@ class MessageOrchestrator:
             ("projects", self.agentic_projects),
             ("cost", self.agentic_cost),
             ("env", self.agentic_env),
+            ("settings", self.agentic_settings),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -487,6 +488,7 @@ class MessageOrchestrator:
                 BotCommand("projects", "List/switch projects"),
                 BotCommand("cost", "Show today's spend"),
                 BotCommand("env", "Manage .env variables (add tokens)"),
+                BotCommand("settings", "Settings overview"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "Alias for /projects"),
                 BotCommand("restart", "Restart the bot"),
@@ -573,6 +575,9 @@ class MessageOrchestrator:
                     InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
                 ],
                 [
+                    InlineKeyboardButton(
+                        "⚙️ Настройки", callback_data="menu:settings"
+                    ),
                     InlineKeyboardButton(
                         "🆕 Новая сессия", callback_data="menu:new"
                     ),
@@ -1897,6 +1902,8 @@ class MessageOrchestrator:
             await self.agentic_cost(fake_update, context)
         elif action == "env":
             await self.agentic_env(fake_update, context)
+        elif action == "settings":
+            await self.agentic_settings(fake_update, context)
         elif action == "new":
             await self.agentic_new(fake_update, context)
         else:
@@ -2079,3 +2086,73 @@ class MessageOrchestrator:
         # Unknown state — clear it just in case
         context.user_data.pop("env_wizard_step", None)
         context.user_data.pop("env_wizard_name", None)
+
+    # --- /settings overview ---
+
+    async def agentic_settings(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Settings panel: shows current config + navigation buttons."""
+        user_id = update.effective_user.id
+        settings = self.settings
+
+        current_dir = context.user_data.get(
+            "current_directory", settings.approved_directory
+        )
+        verbose_level = self._get_verbose_level(context)
+        verbose_label = {0: "quiet", 1: "normal", 2: "detailed"}.get(
+            verbose_level, "?"
+        )
+
+        # User-managed env vars count
+        env_count = len(list_user_keys())
+
+        # Subscription / auth indicator: ANTHROPIC_API_KEY set?
+        api_key = getattr(settings, "anthropic_api_key", None)
+        if api_key:
+            auth_line = "API key (billed by Anthropic)"
+        else:
+            auth_line = "Claude Code OAuth (Max/Pro subscription)"
+
+        voice_provider = getattr(settings, "voice_provider", "—")
+        voice_enabled = getattr(settings, "enable_voice_messages", False)
+        voice_line = (
+            f"{voice_provider}" if voice_enabled else "off"
+        )
+
+        lines: List[str] = [
+            "<b>⚙️ Настройки</b>",
+            "",
+            f"📂 Working dir: <code>{escape_html(str(current_dir))}</code>",
+            f"🔌 Подключение: {auth_line}",
+            f"🤖 Agentic mode: {settings.agentic_mode}",
+            f"📢 Verbose: <b>{verbose_level}</b> ({verbose_label})",
+            f"🎤 Voice: {voice_line}",
+            f"🔑 User env vars: <b>{env_count}</b>",
+            f"🧵 Project threads: {settings.enable_project_threads}",
+        ]
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
+                    InlineKeyboardButton("💰 Расход", callback_data="menu:cost"),
+                ],
+                [
+                    InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
+                    InlineKeyboardButton("📁 Проекты", callback_data="menu:projects"),
+                ],
+            ]
+        )
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="settings", args=[], success=True
+            )
