@@ -32,6 +32,13 @@ from telegram.ext import (
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from .env_manager import (
+    is_valid_key,
+    list_user_keys,
+    write_env_var,
+    PROTECTED_KEYS,
+    MAX_VALUE_LEN,
+)
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -329,6 +336,7 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("projects", self.agentic_projects),
             ("cost", self.agentic_cost),
+            ("env", self.agentic_env),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -406,6 +414,14 @@ class MessageOrchestrator:
             )
         )
 
+        # env: callbacks (env var wizard: add/cancel)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_env_callback),
+                pattern=r"^env:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -470,6 +486,7 @@ class MessageOrchestrator:
                 BotCommand("status", "Show session status"),
                 BotCommand("projects", "List/switch projects"),
                 BotCommand("cost", "Show today's spend"),
+                BotCommand("env", "Manage .env variables (add tokens)"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "Alias for /projects"),
                 BotCommand("restart", "Restart the bot"),
@@ -553,7 +570,12 @@ class MessageOrchestrator:
                 ],
                 [
                     InlineKeyboardButton("💰 Расход", callback_data="menu:cost"),
-                    InlineKeyboardButton("🆕 Новая сессия", callback_data="menu:new"),
+                    InlineKeyboardButton("🔑 Ключи", callback_data="menu:env"),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🆕 Новая сессия", callback_data="menu:new"
+                    ),
                 ],
             ]
         )
@@ -943,6 +965,11 @@ class MessageOrchestrator:
         """Direct Claude passthrough. Simple progress. No suggestions."""
         user_id = update.effective_user.id
         message_text = update.message.text
+
+        # Intercept env wizard input before Claude sees it.
+        if context.user_data.get("env_wizard_step"):
+            await self._handle_env_wizard_input(update, context, message_text)
+            return
 
         logger.info(
             "Agentic text message",
@@ -1868,6 +1895,8 @@ class MessageOrchestrator:
             await self.agentic_status(fake_update, context)
         elif action == "cost":
             await self.agentic_cost(fake_update, context)
+        elif action == "env":
+            await self.agentic_env(fake_update, context)
         elif action == "new":
             await self.agentic_new(fake_update, context)
         else:
@@ -1875,3 +1904,178 @@ class MessageOrchestrator:
                 f"Unknown menu action: <code>{escape_html(action)}</code>",
                 parse_mode="HTML",
             )
+
+    # --- /env wizard ---
+
+    async def agentic_env(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show current user-managed env vars and the 'add' button."""
+        user_id = update.effective_user.id
+        rows = list_user_keys()
+        lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
+        if rows:
+            for key, masked in rows:
+                lines.append(f"• <code>{escape_html(key)}</code> = {escape_html(masked)}")
+        else:
+            lines.append("<i>Пока ничего не добавлено.</i>")
+        lines.append("")
+        lines.append(
+            "Защищённые переменные (бот не даёт менять): "
+            + ", ".join(sorted(PROTECTED_KEYS))
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("➕ Добавить", callback_data="env:add")],
+            ]
+        )
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="env", args=[], success=True
+            )
+
+    async def _agentic_env_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle env:add, env:cancel callbacks."""
+        query = update.callback_query
+        await query.answer()
+        action = query.data.split(":", 1)[1]
+
+        if action == "add":
+            context.user_data["env_wizard_step"] = "waiting_name"
+            context.user_data.pop("env_wizard_name", None)
+            await query.message.reply_text(
+                "Введи <b>имя</b> переменной (UPPER_CASE, латиница+цифры+_).\n"
+                "Например: <code>FIGJAM_TOKEN</code>, "
+                "<code>DEEPGRAM_API_KEY</code>, <code>GITHUB_TOKEN_NASTYA</code>.\n\n"
+                "Защищённые (нельзя): "
+                + ", ".join(sorted(PROTECTED_KEYS))
+                + "\n\nОтмена: /env_cancel",
+                parse_mode="HTML",
+            )
+        elif action == "cancel":
+            context.user_data.pop("env_wizard_step", None)
+            context.user_data.pop("env_wizard_name", None)
+            await query.message.reply_text("Отменено.")
+        else:
+            await query.message.reply_text(
+                f"Unknown env action: <code>{escape_html(action)}</code>",
+                parse_mode="HTML",
+            )
+
+    async def _handle_env_wizard_input(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+    ) -> None:
+        """Process the user's typed input during /env wizard."""
+        step = context.user_data.get("env_wizard_step")
+        text = (text or "").strip()
+
+        # Allow /env_cancel-like escape via plain text
+        if text.lower() in {"отмена", "cancel", "/cancel", "/env_cancel"}:
+            context.user_data.pop("env_wizard_step", None)
+            context.user_data.pop("env_wizard_name", None)
+            await update.message.reply_text("Отменено.")
+            return
+
+        if step == "waiting_name":
+            if not is_valid_key(text):
+                await update.message.reply_text(
+                    "❌ Невалидное имя. Только UPPER_CASE, латиница, цифры, "
+                    "подчёркивания. И нельзя защищённые. Попробуй ещё раз "
+                    "или напиши «отмена»."
+                )
+                return
+            context.user_data["env_wizard_name"] = text
+            context.user_data["env_wizard_step"] = "waiting_value"
+            await update.message.reply_text(
+                f"Имя: <code>{escape_html(text)}</code>\n\n"
+                f"Теперь пришли <b>значение</b> (токен/ключ).\n"
+                f"⚠️ Твоё сообщение со значением будет <b>сразу удалено</b> "
+                f"из чата для безопасности. Значение запишется в .env.",
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "waiting_value":
+            key = context.user_data.get("env_wizard_name", "")
+            # Delete the user's message ASAP (best-effort)
+            try:
+                await update.message.delete()
+            except Exception as exc:
+                logger.warning(
+                    "env_wizard: failed to delete value message",
+                    error=str(exc),
+                    user_id=update.effective_user.id,
+                )
+
+            if not key:
+                context.user_data.pop("env_wizard_step", None)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Что-то пошло не так — имя потерялось. Начни заново через /env.",
+                )
+                return
+
+            if len(text) > MAX_VALUE_LEN:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"❌ Слишком длинное значение ({len(text)} > {MAX_VALUE_LEN}). "
+                    f"Пришли покороче или /env_cancel.",
+                )
+                return
+
+            try:
+                write_env_var(key, text)
+            except Exception as exc:
+                logger.error(
+                    "env_wizard: write failed",
+                    error=str(exc),
+                    key=key,
+                )
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"❌ Не удалось записать в .env: <code>{escape_html(str(exc))}</code>",
+                    parse_mode="HTML",
+                )
+                context.user_data.pop("env_wizard_step", None)
+                context.user_data.pop("env_wizard_name", None)
+                return
+
+            context.user_data.pop("env_wizard_step", None)
+            context.user_data.pop("env_wizard_name", None)
+
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=update.effective_user.id,
+                    command="env_add",
+                    args=[key],
+                    success=True,
+                )
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f"✅ <code>{escape_html(key)}</code> сохранено в .env "
+                    f"(твоё сообщение удалено).\n\n"
+                    f"Для применения нужен restart: пришли <code>/restart</code> "
+                    f"или попроси меня выполнить <code>sudo systemctl restart agent-vps</code>."
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+        # Unknown state — clear it just in case
+        context.user_data.pop("env_wizard_step", None)
+        context.user_data.pop("env_wizard_name", None)
