@@ -327,6 +327,8 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("projects", self.agentic_projects),
+            ("cost", self.agentic_cost),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -396,6 +398,14 @@ class MessageOrchestrator:
             )
         )
 
+        # menu: callbacks (main menu navigation in /start)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_menu_callback),
+                pattern=r"^menu:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -455,11 +465,13 @@ class MessageOrchestrator:
         """Return bot commands appropriate for current mode."""
         if self.settings.agentic_mode:
             commands = [
-                BotCommand("start", "Start the bot"),
+                BotCommand("start", "Menu"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
+                BotCommand("projects", "List/switch projects"),
+                BotCommand("cost", "Show today's spend"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
-                BotCommand("repo", "List repos / switch workspace"),
+                BotCommand("repo", "Alias for /projects"),
                 BotCommand("restart", "Restart the bot"),
             ]
             if self.settings.enable_project_threads:
@@ -533,13 +545,26 @@ class MessageOrchestrator:
         dir_display = f"<code>{current_dir}/</code>"
 
         safe_name = escape_html(user.first_name)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("📁 Проекты", callback_data="menu:projects"),
+                    InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
+                ],
+                [
+                    InlineKeyboardButton("💰 Расход", callback_data="menu:cost"),
+                    InlineKeyboardButton("🆕 Новая сессия", callback_data="menu:new"),
+                ],
+            ]
+        )
         await update.message.reply_text(
             f"Hi {safe_name}! I'm your AI coding assistant.\n"
             f"Just tell me what you need — I can read, write, and run code.\n\n"
             f"Working in: {dir_display}\n"
-            f"Commands: /new (reset) · /status"
+            f"Commands: /new · /status · /projects · /cost · /verbose"
             f"{sync_line}",
             parse_mode="HTML",
+            reply_markup=keyboard,
         )
 
     async def agentic_new(
@@ -1752,4 +1777,101 @@ class MessageOrchestrator:
                 command="cd",
                 args=[project_name],
                 success=True,
+            )
+
+    async def agentic_projects(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Alias for /repo — list projects with inline switch buttons."""
+        await self.agentic_repo(update, context)
+
+    async def agentic_cost(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show today's spend, session totals, and daily limit (if set)."""
+        user_id = update.effective_user.id
+        lines: List[str] = ["<b>💰 Расход</b>", ""]
+
+        rate_limiter = context.bot_data.get("rate_limiter")
+        if rate_limiter:
+            try:
+                status = rate_limiter.get_user_status(user_id)
+                cost_usage = status.get("cost_usage", {}) or {}
+                current = cost_usage.get("current", 0.0)
+                limit = cost_usage.get("limit")
+                remaining = cost_usage.get("remaining")
+                lines.append(f"Сессия: <b>${current:.4f}</b>")
+                if limit is not None:
+                    lines.append(
+                        f"Дневной лимит: <b>${limit:.2f}</b> "
+                        f"(осталось ${remaining:.2f})"
+                        if remaining is not None
+                        else f"Дневной лимит: <b>${limit:.2f}</b>"
+                    )
+                req_usage = status.get("request_usage", {}) or {}
+                if req_usage:
+                    lines.append(
+                        f"Запросов сегодня: <b>{req_usage.get('current', 0)}</b>"
+                        f" / {req_usage.get('limit', '?')}"
+                    )
+            except Exception as exc:
+                lines.append(f"<i>Rate limiter недоступен: {escape_html(str(exc))}</i>")
+        else:
+            lines.append("<i>Rate limiter не сконфигурирован.</i>")
+
+        storage = context.bot_data.get("storage")
+        if storage and getattr(storage, "costs", None):
+            try:
+                rows = await storage.costs.get_user_daily_costs(user_id, days=1)
+                if rows:
+                    today = rows[0]
+                    lines.append("")
+                    lines.append(
+                        f"Всего за сегодня (БД): <b>${today.daily_cost:.4f}</b>"
+                        f" · запросов: {today.request_count}"
+                    )
+            except Exception:
+                pass
+
+        # Audit log
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="cost",
+                args=[],
+                success=True,
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _agentic_menu_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle menu: callbacks from /start inline keyboard.
+
+        Builds a minimal Update where update.message points at the callback's
+        message so existing handlers (which use update.message.reply_text) work.
+        """
+        query = update.callback_query
+        await query.answer()
+        action = query.data.split(":", 1)[1]
+
+        # Build a fake Update pointing at the callback's message + same user
+        fake_update = Update(update_id=update.update_id, message=query.message)
+        # effective_user falls back to message.from_user; override to actual clicker
+        fake_update._effective_user = query.from_user  # type: ignore[attr-defined]
+
+        if action == "projects":
+            await self.agentic_repo(fake_update, context)
+        elif action == "status":
+            await self.agentic_status(fake_update, context)
+        elif action == "cost":
+            await self.agentic_cost(fake_update, context)
+        elif action == "new":
+            await self.agentic_new(fake_update, context)
+        else:
+            await query.message.reply_text(
+                f"Unknown menu action: <code>{escape_html(action)}</code>",
+                parse_mode="HTML",
             )
