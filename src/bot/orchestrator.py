@@ -587,12 +587,36 @@ class MessageOrchestrator:
                 ],
             ]
         )
+
+        welcome_text: Optional[str] = None
+        wmf = self.settings.welcome_message_file
+        if wmf is not None:
+            try:
+                raw = Path(wmf).read_text(encoding="utf-8")
+                welcome_text = raw.format(
+                    first_name=safe_name,
+                    dir=dir_display,
+                    ro_badge=ro_badge,
+                    sync_line=sync_line,
+                )
+            except (OSError, KeyError, ValueError) as exc:
+                logger.warning(
+                    "welcome_message_file unreadable, falling back to default",
+                    path=str(wmf),
+                    error=str(exc),
+                )
+
+        if welcome_text is None:
+            welcome_text = (
+                f"Hi {safe_name}! I'm your AI coding assistant.{ro_badge}\n"
+                f"Just tell me what you need — I can read, write, and run code.\n\n"
+                f"Working in: {dir_display}\n"
+                f"Commands: /new · /status · /projects · /cost · /verbose"
+                f"{sync_line}"
+            )
+
         await update.message.reply_text(
-            f"Hi {safe_name}! I'm your AI coding assistant.{ro_badge}\n"
-            f"Just tell me what you need — I can read, write, and run code.\n\n"
-            f"Working in: {dir_display}\n"
-            f"Commands: /new · /status · /projects · /cost · /verbose"
-            f"{sync_line}",
+            welcome_text,
             parse_mode="HTML",
             reply_markup=keyboard,
         )

@@ -267,6 +267,14 @@ class Settings(BaseSettings):
             "or sub-user bots that should only inspect a project, not change it."
         ),
     )
+    welcome_message_file: Optional[Path] = Field(
+        None,
+        description=(
+            "Path to an HTML file whose contents replace the default /start "
+            "welcome text. Supports {first_name} and {dir} placeholders. "
+            "Useful for partner deployments that need a tailored onboarding."
+        ),
+    )
 
     # Reply quoting
     reply_quote: bool = Field(
