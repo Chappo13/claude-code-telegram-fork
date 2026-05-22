@@ -338,6 +338,7 @@ class MessageOrchestrator:
             ("cost", self.agentic_cost),
             ("env", self.agentic_env),
             ("settings", self.agentic_settings),
+            ("stop", self.agentic_stop),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -489,6 +490,7 @@ class MessageOrchestrator:
                 BotCommand("cost", "Show today's spend"),
                 BotCommand("env", "Manage .env variables (add tokens)"),
                 BotCommand("settings", "Settings overview"),
+                BotCommand("stop", "Stop the currently running task"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "Alias for /projects"),
                 BotCommand("restart", "Restart the bot"),
@@ -2202,3 +2204,37 @@ class MessageOrchestrator:
             "that they need to ask the bot's owner.]\n\n"
         )
         return guard + prompt
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Global stop command: interrupt the user's currently running Claude task.
+
+        Equivalent to tapping the inline "Stop" button under the latest
+        Working... message, but available as a regular command from the menu
+        or by typing /stop.
+        """
+        user_id = update.effective_user.id
+        active = self._active_requests.get(user_id)
+        if not active:
+            await update.message.reply_text(
+                "Нет активной задачи. Тебе нечего останавливать."
+            )
+            return
+        if active.interrupted:
+            await update.message.reply_text("Уже останавливается...")
+            return
+
+        active.interrupt_event.set()
+        active.interrupted = True
+        try:
+            await active.progress_msg.edit_text("Stopping...", reply_markup=None)
+        except Exception:
+            pass
+        await update.message.reply_text("🛑 Сигнал остановки отправлен.")
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id, command="stop", args=[], success=True
+            )
