@@ -1640,7 +1640,10 @@ class MessageOrchestrator:
         /repo          — list subdirectories with git indicators
         /repo <name>   — switch to that directory, resume session if available
         """
-        args = update.message.text.split()[1:] if update.message.text else []
+        if context.user_data.get("_invoked_from_menu"):
+            args: List[str] = []
+        else:
+            args = update.message.text.split()[1:] if update.message.text else []
         base = self.settings.approved_directory
         current_dir = context.user_data.get("current_directory", base)
 
@@ -1883,8 +1886,9 @@ class MessageOrchestrator:
     ) -> None:
         """Handle menu: callbacks from /start inline keyboard.
 
-        Builds a minimal Update where update.message points at the callback's
-        message so existing handlers (which use update.message.reply_text) work.
+        Sets context.user_data["_invoked_from_menu"]=True so handlers that
+        parse args from update.message.text know to ignore them (the fake
+        message is the bot's own /start text, not a real user command).
         """
         query = update.callback_query
         await query.answer()
@@ -1895,23 +1899,27 @@ class MessageOrchestrator:
         # effective_user falls back to message.from_user; override to actual clicker
         fake_update._effective_user = query.from_user  # type: ignore[attr-defined]
 
-        if action == "projects":
-            await self.agentic_repo(fake_update, context)
-        elif action == "status":
-            await self.agentic_status(fake_update, context)
-        elif action == "cost":
-            await self.agentic_cost(fake_update, context)
-        elif action == "env":
-            await self.agentic_env(fake_update, context)
-        elif action == "settings":
-            await self.agentic_settings(fake_update, context)
-        elif action == "new":
-            await self.agentic_new(fake_update, context)
-        else:
-            await query.message.reply_text(
-                f"Unknown menu action: <code>{escape_html(action)}</code>",
-                parse_mode="HTML",
-            )
+        context.user_data["_invoked_from_menu"] = True
+        try:
+            if action == "projects":
+                await self.agentic_repo(fake_update, context)
+            elif action == "status":
+                await self.agentic_status(fake_update, context)
+            elif action == "cost":
+                await self.agentic_cost(fake_update, context)
+            elif action == "env":
+                await self.agentic_env(fake_update, context)
+            elif action == "settings":
+                await self.agentic_settings(fake_update, context)
+            elif action == "new":
+                await self.agentic_new(fake_update, context)
+            else:
+                await query.message.reply_text(
+                    f"Unknown menu action: <code>{escape_html(action)}</code>",
+                    parse_mode="HTML",
+                )
+        finally:
+            context.user_data.pop("_invoked_from_menu", None)
 
     # --- /env wizard ---
 
