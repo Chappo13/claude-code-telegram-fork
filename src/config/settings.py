@@ -259,6 +259,14 @@ class Settings(BaseSettings):
         True,
         description="Conversational agentic mode (default) vs classic command mode",
     )
+    read_only_mode: bool = Field(
+        False,
+        description=(
+            "Limit the bot to read-only operations: block /env, /restart, /new, "
+            "deny tool calls that write/edit/delete files. Intended for partner "
+            "or sub-user bots that should only inspect a project, not change it."
+        ),
+    )
 
     # Reply quoting
     reply_quote: bool = Field(

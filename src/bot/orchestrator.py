@@ -564,6 +564,7 @@ class MessageOrchestrator:
         dir_display = f"<code>{current_dir}/</code>"
 
         safe_name = escape_html(user.first_name)
+        ro_badge = " · 🔒 read-only" if self.settings.read_only_mode else ""
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -585,7 +586,7 @@ class MessageOrchestrator:
             ]
         )
         await update.message.reply_text(
-            f"Hi {safe_name}! I'm your AI coding assistant.\n"
+            f"Hi {safe_name}! I'm your AI coding assistant.{ro_badge}\n"
             f"Just tell me what you need — I can read, write, and run code.\n\n"
             f"Working in: {dir_display}\n"
             f"Commands: /new · /status · /projects · /cost · /verbose"
@@ -1064,7 +1065,7 @@ class MessageOrchestrator:
         success = True
         try:
             claude_response = await claude_integration.run_command(
-                prompt=message_text,
+                prompt=self._maybe_prefix_readonly(message_text),
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
@@ -1919,6 +1920,14 @@ class MessageOrchestrator:
     ) -> None:
         """Show current user-managed env vars and the 'add' button."""
         user_id = update.effective_user.id
+        if self.settings.read_only_mode:
+            await update.message.reply_text(
+                "🔒 <b>Read-only mode</b>\n\n"
+                "Этот бот работает в режиме только-чтение. "
+                "Изменение переменных окружения недоступно.",
+                parse_mode="HTML",
+            )
+            return
         rows = list_user_keys()
         lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
         if rows:
@@ -1957,6 +1966,11 @@ class MessageOrchestrator:
         action = query.data.split(":", 1)[1]
 
         if action == "add":
+            if self.settings.read_only_mode:
+                await query.message.reply_text(
+                    "🔒 Read-only mode — добавление переменных недоступно."
+                )
+                return
             context.user_data["env_wizard_step"] = "waiting_name"
             context.user_data.pop("env_wizard_name", None)
             await query.message.reply_text(
@@ -2120,11 +2134,13 @@ class MessageOrchestrator:
             f"{voice_provider}" if voice_enabled else "off"
         )
 
+        ro_line = "🔒 <b>Read-only mode</b>" if settings.read_only_mode else "🔓 Full access"
         lines: List[str] = [
             "<b>⚙️ Настройки</b>",
             "",
             f"📂 Working dir: <code>{escape_html(str(current_dir))}</code>",
             f"🔌 Подключение: {auth_line}",
+            f"{ro_line}",
             f"🤖 Agentic mode: {settings.agentic_mode}",
             f"📢 Verbose: <b>{verbose_level}</b> ({verbose_label})",
             f"🎤 Voice: {voice_line}",
@@ -2156,3 +2172,25 @@ class MessageOrchestrator:
             await audit_logger.log_command(
                 user_id=user_id, command="settings", args=[], success=True
             )
+
+    def _maybe_prefix_readonly(self, prompt: str) -> str:
+        """In read_only_mode, inject a guardrail prefix into every user prompt.
+
+        Not a hard security boundary (Claude can still call tools), but it
+        primes the assistant to refuse destructive actions. Hard enforcement
+        belongs in ToolMonitor; this is the cheap signal.
+        """
+        if not self.settings.read_only_mode:
+            return prompt
+        guard = (
+            "[SYSTEM CONSTRAINT: READ_ONLY_MODE — "
+            "this bot is shared with a partner who only has read access. "
+            "DO NOT use Write/Edit/MultiEdit/NotebookEdit tools. "
+            "DO NOT run shell commands that modify files (rm, mv, dd, chmod, "
+            "chown, truncate, tee, cp into protected paths). "
+            "DO NOT modify .env, .git, systemd units, or anything under /etc /opt /usr. "
+            "Read-only inspection is fine: ls, cat, grep, find, git log/diff/status. "
+            "If the user requests a destructive action, refuse politely and explain "
+            "that they need to ask the bot's owner.]\n\n"
+        )
+        return guard + prompt
