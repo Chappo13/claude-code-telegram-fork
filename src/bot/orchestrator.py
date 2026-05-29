@@ -333,6 +333,8 @@ class MessageOrchestrator:
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
+            ("model", self.agentic_model),
+            ("thinking", self.agentic_thinking),
             ("repo", self.agentic_repo),
             ("projects", self.agentic_projects),
             ("cost", self.agentic_cost),
@@ -344,7 +346,7 @@ class MessageOrchestrator:
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
         if self.settings.partner_mode:
-            hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose"}
+            hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose", "model", "thinking"}
             handlers = [(c, h) for c, h in handlers if c not in hidden]
 
         # Derive known commands dynamically — avoids drift when new commands are added
@@ -427,6 +429,22 @@ class MessageOrchestrator:
             )
         )
 
+        # model: callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_model_callback),
+                pattern=r"^model:",
+            )
+        )
+
+        # thinking: callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_thinking_callback),
+                pattern=r"^thinking:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -501,7 +519,7 @@ class MessageOrchestrator:
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
             if self.settings.partner_mode:
-                hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose"}
+                hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose", "model", "thinking"}
                 commands = [c for c in commands if c.command not in hidden]
             return commands
         else:
@@ -1962,6 +1980,10 @@ class MessageOrchestrator:
                 await self.agentic_settings(fake_update, context)
             elif action == "new":
                 await self.agentic_new(fake_update, context)
+            elif action == "model":
+                await self.agentic_model(fake_update, context)
+            elif action == "thinking":
+                await self.agentic_thinking(fake_update, context)
             else:
                 await query.message.reply_text(
                     f"Unknown menu action: <code>{escape_html(action)}</code>",
@@ -2048,6 +2070,136 @@ class MessageOrchestrator:
                 f"Unknown env action: <code>{escape_html(action)}</code>",
                 parse_mode="HTML",
             )
+
+    # --- /model and /thinking ---
+
+    _CLAUDE_MODELS = [
+        ("claude-opus-4-8", "Opus 4.8 — новейшая"),
+        ("claude-opus-4-7", "Opus 4.7"),
+        ("claude-sonnet-4-6", "Sonnet 4.6"),
+        ("claude-haiku-4-5", "Haiku 4.5"),
+    ]
+
+    _THINKING_LEVELS = [
+        ("low", "Low — минимум"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("xhigh", "Extra High — максимум"),
+    ]
+
+    def _apply_runtime_setting(self, attr: str, value: str, env_key: str) -> None:
+        """In-memory patch + persist to .env so it survives restart."""
+        setattr(self.settings, attr, value)
+        try:
+            write_env_var(env_key, value)
+        except Exception as e:
+            logger.error("Failed to persist env var", key=env_key, error=str(e))
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/model — show current model + picker, or set via arg."""
+        user_id = update.effective_user.id
+        if context.user_data.get("_invoked_from_menu"):
+            args = []
+        else:
+            args = update.message.text.split()[1:] if update.message.text else []
+        valid_ids = {mid for mid, _ in self._CLAUDE_MODELS}
+        if args:
+            model_id = args[0].strip()
+            if model_id not in valid_ids:
+                await update.message.reply_text(
+                    "Неизвестная модель. Доступные: " + ", ".join(sorted(valid_ids)),
+                )
+                return
+            self._apply_runtime_setting("claude_model", model_id, "CLAUDE_MODEL")
+            await update.message.reply_text(
+                "Модель → <code>" + escape_html(model_id) + "</code>",
+                parse_mode="HTML",
+            )
+            return
+        current = self.settings.claude_model or "не задана"
+        rows = []
+        for mid, label in self._CLAUDE_MODELS:
+            marker = " ✓" if mid == self.settings.claude_model else ""
+            rows.append([InlineKeyboardButton(label + marker, callback_data="model:" + mid)])
+        keyboard = InlineKeyboardMarkup(rows)
+        text = ("<b>🤖 Модель</b>" + chr(10) + chr(10) +
+                "Текущая: <code>" + escape_html(str(current)) + "</code>" + chr(10) + chr(10) +
+                "Выбери:")
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="model", args=args, success=True)
+
+    async def _agentic_model_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle model:<id> callback buttons."""
+        query = update.callback_query
+        await query.answer()
+        model_id = query.data.split(":", 1)[1]
+        valid_ids = {mid for mid, _ in self._CLAUDE_MODELS}
+        if model_id not in valid_ids:
+            await query.message.reply_text("Неизвестная модель.")
+            return
+        self._apply_runtime_setting("claude_model", model_id, "CLAUDE_MODEL")
+        await query.edit_message_text(
+            "Модель → <code>" + escape_html(model_id) + "</code>",
+            parse_mode="HTML",
+        )
+
+    async def agentic_thinking(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/thinking — show current effort + picker, or set via arg."""
+        user_id = update.effective_user.id
+        if context.user_data.get("_invoked_from_menu"):
+            args = []
+        else:
+            args = update.message.text.split()[1:] if update.message.text else []
+        valid_levels = {lvl for lvl, _ in self._THINKING_LEVELS}
+        if args:
+            level = args[0].strip().lower()
+            if level not in valid_levels:
+                await update.message.reply_text("Уровни: low, medium, high, xhigh")
+                return
+            self._apply_runtime_setting("claude_thinking_effort", level, "CLAUDE_THINKING_EFFORT")
+            await update.message.reply_text(
+                "Thinking → <code>" + escape_html(level) + "</code>",
+                parse_mode="HTML",
+            )
+            return
+        current = self.settings.claude_thinking_effort
+        rows = []
+        for lvl, label in self._THINKING_LEVELS:
+            marker = " ✓" if lvl == current else ""
+            rows.append([InlineKeyboardButton(label + marker, callback_data="thinking:" + lvl)])
+        keyboard = InlineKeyboardMarkup(rows)
+        text = ("<b>🧠 Thinking effort</b>" + chr(10) + chr(10) +
+                "Текущий: <code>" + escape_html(current) + "</code>" + chr(10) + chr(10) +
+                "Выбери:")
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="thinking", args=args, success=True)
+
+    async def _agentic_thinking_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle thinking:<level> callback buttons."""
+        query = update.callback_query
+        await query.answer()
+        level = query.data.split(":", 1)[1]
+        valid_levels = {lvl for lvl, _ in self._THINKING_LEVELS}
+        if level not in valid_levels:
+            await query.message.reply_text("Неизвестный уровень.")
+            return
+        self._apply_runtime_setting("claude_thinking_effort", level, "CLAUDE_THINKING_EFFORT")
+        await query.edit_message_text(
+            "Thinking → <code>" + escape_html(level) + "</code>",
+            parse_mode="HTML",
+        )
 
     async def _handle_env_wizard_input(
         self,
@@ -2199,6 +2351,8 @@ class MessageOrchestrator:
             f"🔌 Подключение: {auth_line}",
             f"{ro_line}",
             f"🤖 Agentic mode: {settings.agentic_mode}",
+            f"🧬 Model: <code>{escape_html(str(settings.claude_model or '—'))}</code>",
+            f"🧠 Thinking: <b>{settings.claude_thinking_effort}</b>",
             f"📢 Verbose: <b>{verbose_level}</b> ({verbose_label})",
             f"🎤 Voice: {voice_line}",
             f"🔑 User env vars: <b>{env_count}</b>",
@@ -2214,6 +2368,10 @@ class MessageOrchestrator:
                 [
                     InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
                     InlineKeyboardButton("📁 Проекты", callback_data="menu:projects"),
+                ],
+                [
+                    InlineKeyboardButton("🧬 Модель", callback_data="menu:model"),
+                    InlineKeyboardButton("🧠 Thinking", callback_data="menu:thinking"),
                 ],
             ]
         )

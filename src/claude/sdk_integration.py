@@ -318,10 +318,15 @@ class ClaudeSDKManager:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
 
-            # Build Claude Agent options
+            # Build Claude Agent options.
+            # thinking={"type":"adaptive"} + effort is the supported way to
+            # control reasoning depth on Opus 4.7/4.8 (manual budget_tokens
+            # returns 400 on those models).
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
                 model=self.config.claude_model or None,
+                thinking={"type": "adaptive"},
+                effort=self.config.claude_thinking_effort,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,

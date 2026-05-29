@@ -79,7 +79,15 @@ class Settings(BaseSettings):
         description="Anthropic API key for SDK (optional if CLI logged in)",
     )
     claude_model: Optional[str] = Field(
-        None, description="Claude model to use (defaults to CLI default if unset)"
+        "claude-opus-4-8",
+        description="Claude model to use (defaults to Opus 4.8)",
+    )
+    claude_thinking_effort: Literal["low", "medium", "high", "xhigh"] = Field(
+        "xhigh",
+        description=(
+            "Adaptive thinking effort for Opus 4.7/4.8. "
+            "xhigh = deepest reasoning. Set via CLAUDE_THINKING_EFFORT."
+        ),
     )
     claude_max_turns: int = Field(
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
