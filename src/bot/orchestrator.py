@@ -33,8 +33,12 @@ from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .env_manager import (
+    delete_env_var,
     is_valid_key,
     list_user_keys,
+    mask_value,
+    read_env_file,
+    read_env_value,
     write_env_var,
     PROTECTED_KEYS,
     MAX_VALUE_LEN,
@@ -2030,22 +2034,39 @@ class MessageOrchestrator:
             )
             return
         rows = list_user_keys()
+        all_env = read_env_file()
+        # Build full list: user keys (editable) + protected keys (read-only display).
+        editable_keys = [k for k, _ in rows]
+        protected_present = sorted(k for k in all_env.keys() if k in PROTECTED_KEYS)
+
         lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
-        if rows:
-            for key, masked in rows:
-                lines.append(f"• <code>{escape_html(key)}</code> = {escape_html(masked)}")
-        else:
+        if not editable_keys and not protected_present:
             lines.append("<i>Пока ничего не добавлено.</i>")
-        lines.append("")
-        lines.append(
-            "Защищённые переменные (бот не даёт менять): "
-            + ", ".join(sorted(PROTECTED_KEYS))
-        )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("➕ Добавить", callback_data="env:add")],
-            ]
-        )
+        else:
+            lines.append("Тапни ключ — увидишь значение и сможешь заменить/удалить.")
+            if protected_present:
+                lines.append("")
+                lines.append("🔒 — защищённые, только просмотр.")
+
+        keyboard_rows: List[List[InlineKeyboardButton]] = []
+        # Editable keys first.
+        for key in editable_keys:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    "🔑 " + key,
+                    callback_data="env:k:" + key,
+                ),
+            ])
+        # Protected (read-only).
+        for key in protected_present:
+            keyboard_rows.append([
+                InlineKeyboardButton(
+                    "🔒 " + key,
+                    callback_data="env:k:" + key,
+                ),
+            ])
+        keyboard_rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data="env:add")])
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
         await update.message.reply_text(
             "\n".join(lines),
             parse_mode="HTML",
@@ -2061,10 +2082,38 @@ class MessageOrchestrator:
     async def _agentic_env_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle env:add, env:cancel callbacks."""
+        """Handle env:add, env:cancel, env:k|v|r|d|D|back callbacks."""
         query = update.callback_query
         await query.answer()
-        action = query.data.split(":", 1)[1]
+        # callback_data forms:
+        #   env:add, env:cancel, env:back
+        #   env:k:<KEY>   — show key detail screen
+        #   env:v:<KEY>   — reveal value
+        #   env:r:<KEY>   — start replace wizard
+        #   env:d:<KEY>   — ask delete confirmation
+        #   env:D:<KEY>   — confirmed delete
+        parts = query.data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        key = parts[2] if len(parts) > 2 else ""
+
+        if action == "k":
+            await self._env_show_key_detail(update, context, key)
+            return
+        if action == "v":
+            await self._env_reveal_value(update, context, key)
+            return
+        if action == "r":
+            await self._env_start_replace(update, context, key)
+            return
+        if action == "d":
+            await self._env_ask_delete(update, context, key)
+            return
+        if action == "D":
+            await self._env_do_delete(update, context, key)
+            return
+        if action == "back":
+            await self._env_back_to_list(update, context)
+            return
 
         if action == "add":
             if self.settings.read_only_mode:
@@ -2092,6 +2141,183 @@ class MessageOrchestrator:
                 f"Unknown env action: <code>{escape_html(action)}</code>",
                 parse_mode="HTML",
             )
+
+    # --- env key detail helpers ---
+
+    def _env_is_protected(self, key: str) -> bool:
+        return key in PROTECTED_KEYS
+
+    async def _env_show_key_detail(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    ) -> None:
+        """Show one env key with action buttons."""
+        query = update.callback_query
+        if not is_valid_key(key) and key not in PROTECTED_KEYS:
+            # is_valid_key rejects protected names; allow if it is one of those
+            from .env_manager import VALID_KEY_RE
+            if not VALID_KEY_RE.match(key):
+                await query.message.reply_text("Неизвестный ключ.")
+                return
+        raw = read_env_value(key)
+        if raw is None:
+            await query.edit_message_text(
+                "Ключ <code>" + escape_html(key) + "</code> уже отсутствует.",
+                parse_mode="HTML",
+            )
+            return
+        masked = mask_value(raw)
+        protected = self._env_is_protected(key)
+        lines = [
+            "<b>" + ("🔒 " if protected else "🔑 ") + escape_html(key) + "</b>",
+            "",
+            "Значение: <code>" + escape_html(masked) + "</code>",
+        ]
+        if protected:
+            lines.append("")
+            lines.append("<i>Защищённый ключ — менять можно только из консоли VPS.</i>")
+        buttons: List[List[InlineKeyboardButton]] = []
+        buttons.append([InlineKeyboardButton("📋 Показать значение", callback_data="env:v:" + key)])
+        if not protected:
+            buttons.append([
+                InlineKeyboardButton("✏ Заменить", callback_data="env:r:" + key),
+                InlineKeyboardButton("🗑 Удалить", callback_data="env:d:" + key),
+            ])
+        buttons.append([InlineKeyboardButton("⬅ К списку", callback_data="env:back")])
+        await query.edit_message_text(
+            chr(10).join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def _env_reveal_value(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    ) -> None:
+        """Send the raw value in a separate message so the user can long-press to copy."""
+        query = update.callback_query
+        raw = read_env_value(key)
+        if raw is None:
+            await query.message.reply_text("Ключ не найден.")
+            return
+        warn = (
+            "⚠ Значение <code>" + escape_html(key) + "</code> ниже. "
+            "Зажми его, чтобы скопировать. Не пересылай в другие чаты."
+        )
+        await query.message.reply_text(warn, parse_mode="HTML")
+        # Value as a separate message — code block, full content
+        await query.message.reply_text(
+            "<code>" + escape_html(raw) + "</code>",
+            parse_mode="HTML",
+        )
+
+    async def _env_start_replace(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    ) -> None:
+        """Switch wizard to waiting_replace_value step."""
+        query = update.callback_query
+        if self._env_is_protected(key):
+            await query.message.reply_text("Защищённый ключ, замена недоступна.")
+            return
+        if read_env_value(key) is None:
+            await query.message.reply_text("Ключ не найден.")
+            return
+        context.user_data["env_wizard_step"] = "waiting_replace_value"
+        context.user_data["env_wizard_name"] = key
+        await query.message.reply_text(
+            "Замена <code>" + escape_html(key) + "</code>." + chr(10) + chr(10) +
+            "Пришли <b>новое значение</b>. Сообщение со значением будет удалено." + chr(10) +
+            "Отмена: /env_cancel",
+            parse_mode="HTML",
+        )
+
+    async def _env_ask_delete(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    ) -> None:
+        """Ask for delete confirmation."""
+        query = update.callback_query
+        if self._env_is_protected(key):
+            await query.message.reply_text("Защищённый ключ, удаление недоступно.")
+            return
+        if read_env_value(key) is None:
+            await query.edit_message_text(
+                "Ключ <code>" + escape_html(key) + "</code> уже отсутствует.",
+                parse_mode="HTML",
+            )
+            return
+        await query.edit_message_text(
+            "Удалить <code>" + escape_html(key) + "</code> из .env?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✓ Удалить", callback_data="env:D:" + key),
+                InlineKeyboardButton("✗ Отмена", callback_data="env:k:" + key),
+            ]]),
+        )
+
+    async def _env_do_delete(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, key: str
+    ) -> None:
+        """Actually delete the key."""
+        query = update.callback_query
+        if self._env_is_protected(key):
+            await query.message.reply_text("Защищённый ключ.")
+            return
+        try:
+            ok = delete_env_var(key)
+        except Exception as e:
+            logger.error("delete_env_var failed", key=key, error=str(e))
+            await query.message.reply_text(
+                "Ошибка удаления: <code>" + escape_html(str(e)) + "</code>",
+                parse_mode="HTML",
+            )
+            return
+        if not ok:
+            await query.edit_message_text(
+                "Ключ <code>" + escape_html(key) + "</code> уже отсутствовал.",
+                parse_mode="HTML",
+            )
+            return
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=update.effective_user.id,
+                command="env_delete",
+                args=[key],
+                success=True,
+            )
+        await query.edit_message_text(
+            "✅ <code>" + escape_html(key) + "</code> удалён из .env." + chr(10) + chr(10) +
+            "Для применения нужен restart: <code>/restart</code> или " +
+            "<code>sudo systemctl restart agent-vps</code>.",
+            parse_mode="HTML",
+        )
+
+    async def _env_back_to_list(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Re-render the /env list in place of the detail message."""
+        query = update.callback_query
+        rows = list_user_keys()
+        all_env = read_env_file()
+        editable_keys = [k for k, _ in rows]
+        protected_present = sorted(k for k in all_env.keys() if k in PROTECTED_KEYS)
+        lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
+        if not editable_keys and not protected_present:
+            lines.append("<i>Пока ничего не добавлено.</i>")
+        else:
+            lines.append("Тапни ключ — увидишь значение и сможешь заменить/удалить.")
+            if protected_present:
+                lines.append("")
+                lines.append("🔒 — защищённые, только просмотр.")
+        keyboard_rows: List[List[InlineKeyboardButton]] = []
+        for k in editable_keys:
+            keyboard_rows.append([InlineKeyboardButton("🔑 " + k, callback_data="env:k:" + k)])
+        for k in protected_present:
+            keyboard_rows.append([InlineKeyboardButton("🔒 " + k, callback_data="env:k:" + k)])
+        keyboard_rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data="env:add")])
+        await query.edit_message_text(
+            chr(10).join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
 
     # --- /model and /thinking ---
 
@@ -2466,6 +2692,71 @@ class MessageOrchestrator:
                     f"(твоё сообщение удалено).\n\n"
                     f"Для применения нужен restart: пришли <code>/restart</code> "
                     f"или попроси меня выполнить <code>sudo systemctl restart agent-vps</code>."
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+        if step == "waiting_replace_value":
+            key = context.user_data.get("env_wizard_name", "")
+            # Delete the user message ASAP
+            try:
+                await update.message.delete()
+            except Exception as exc:
+                logger.warning(
+                    "env_wizard: failed to delete replace value message",
+                    error=str(exc),
+                    user_id=update.effective_user.id,
+                )
+            if not key:
+                context.user_data.pop("env_wizard_step", None)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Имя ключа потерялось. Начни заново через /env.",
+                )
+                return
+            if key in PROTECTED_KEYS:
+                context.user_data.pop("env_wizard_step", None)
+                context.user_data.pop("env_wizard_name", None)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Защищённый ключ — нельзя заменить через бот.",
+                )
+                return
+            if len(text) > MAX_VALUE_LEN:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Слишком длинное значение. Пришли покороче или /env_cancel.",
+                )
+                return
+            try:
+                write_env_var(key, text)
+            except Exception as exc:
+                logger.error("env_wizard replace write failed", error=str(exc), key=key)
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="❌ Не удалось записать: <code>" + escape_html(str(exc)) + "</code>",
+                    parse_mode="HTML",
+                )
+                context.user_data.pop("env_wizard_step", None)
+                context.user_data.pop("env_wizard_name", None)
+                return
+            context.user_data.pop("env_wizard_step", None)
+            context.user_data.pop("env_wizard_name", None)
+            audit_logger = context.bot_data.get("audit_logger")
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=update.effective_user.id,
+                    command="env_replace",
+                    args=[key],
+                    success=True,
+                )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    "✅ <code>" + escape_html(key) + "</code> заменён в .env." + chr(10) + chr(10) +
+                    "Для применения нужен restart: <code>/restart</code> или " +
+                    "<code>sudo systemctl restart agent-vps</code>."
                 ),
                 parse_mode="HTML",
             )

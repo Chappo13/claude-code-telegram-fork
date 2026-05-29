@@ -145,3 +145,41 @@ def write_env_var(name: str, value: str, path: Path = ENV_FILE_PATH) -> None:
     tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
     tmp.chmod(0o600)
     tmp.replace(path)
+
+
+def read_env_value(name: str, path: Path = ENV_FILE_PATH) -> str | None:
+    """Return raw value for KEY in .env, or None if missing."""
+    env = read_env_file(path)
+    return env.get(name)
+
+
+def delete_env_var(name: str, path: Path = ENV_FILE_PATH) -> bool:
+    """Remove the KEY=VAL line from .env. Returns True if removed."""
+    if name in PROTECTED_KEYS:
+        raise ValueError(f"refusing to delete protected key: {name!r}")
+    if not VALID_KEY_RE.match(name):
+        raise ValueError(f"invalid key name: {name!r}")
+    if not path.exists():
+        return False
+    existing = path.read_text(encoding="utf-8").splitlines()
+    out: List[str] = []
+    removed = False
+    for line in existing:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            out.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key == name:
+            removed = True
+            continue
+        out.append(line)
+    if not removed:
+        return False
+    while out and not out[-1].strip():
+        out.pop()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(out) + "\n" if out else "", encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    return True
