@@ -335,6 +335,8 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("model", self.agentic_model),
             ("thinking", self.agentic_thinking),
+            ("timeout", self.agentic_timeout),
+            ("turns", self.agentic_turns),
             ("repo", self.agentic_repo),
             ("projects", self.agentic_projects),
             ("cost", self.agentic_cost),
@@ -346,7 +348,7 @@ class MessageOrchestrator:
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
         if self.settings.partner_mode:
-            hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose", "model", "thinking"}
+            hidden = {"projects", "repo", "restart", "cost", "env", "status", "settings", "verbose", "model", "thinking", "timeout", "turns"}
             handlers = [(c, h) for c, h in handlers if c not in hidden]
 
         # Derive known commands dynamically — avoids drift when new commands are added
@@ -442,6 +444,22 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._agentic_thinking_callback),
                 pattern=r"^thinking:",
+            )
+        )
+
+        # timeout: callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_timeout_callback),
+                pattern=r"^timeout:",
+            )
+        )
+
+        # turns: callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_turns_callback),
+                pattern=r"^turns:",
             )
         )
 
@@ -1984,6 +2002,10 @@ class MessageOrchestrator:
                 await self.agentic_model(fake_update, context)
             elif action == "thinking":
                 await self.agentic_thinking(fake_update, context)
+            elif action == "timeout":
+                await self.agentic_timeout(fake_update, context)
+            elif action == "turns":
+                await self.agentic_turns(fake_update, context)
             else:
                 await query.message.reply_text(
                     f"Unknown menu action: <code>{escape_html(action)}</code>",
@@ -2201,6 +2223,149 @@ class MessageOrchestrator:
             parse_mode="HTML",
         )
 
+    # --- /timeout and /turns ---
+
+    _TIMEOUT_OPTIONS = [
+        (300, "5 мин"),
+        (900, "15 мин"),
+        (1800, "30 мин"),
+        (3600, "1 час"),
+        (7200, "2 часа"),
+    ]
+
+    _TURNS_OPTIONS = [
+        (50, "50"),
+        (100, "100"),
+        (200, "200"),
+        (500, "500"),
+    ]
+
+    async def agentic_timeout(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/timeout — picker for Claude operation timeout (seconds)."""
+        user_id = update.effective_user.id
+        if context.user_data.get("_invoked_from_menu"):
+            args = []
+        else:
+            args = update.message.text.split()[1:] if update.message.text else []
+        if args:
+            try:
+                seconds = int(args[0])
+            except ValueError:
+                await update.message.reply_text("Передай число секунд, например /timeout 3600")
+                return
+            if seconds < 60 or seconds > 14400:
+                await update.message.reply_text("Диапазон: 60 — 14400 секунд (от минуты до 4 часов).")
+                return
+            setattr(self.settings, "claude_timeout_seconds", seconds)
+            try:
+                write_env_var("CLAUDE_TIMEOUT_SECONDS", str(seconds))
+            except Exception as e:
+                logger.error("Failed to persist CLAUDE_TIMEOUT_SECONDS", error=str(e))
+            await update.message.reply_text(
+                "Timeout → <b>" + str(seconds) + "</b> сек",
+                parse_mode="HTML",
+            )
+            return
+        current = self.settings.claude_timeout_seconds
+        rows = []
+        for v, label in self._TIMEOUT_OPTIONS:
+            marker = " ✓" if v == current else ""
+            rows.append([InlineKeyboardButton(label + marker, callback_data="timeout:" + str(v))])
+        keyboard = InlineKeyboardMarkup(rows)
+        text = ("<b>⏱ Timeout</b>" + chr(10) + chr(10) +
+                "Текущий: <b>" + str(current) + "</b> сек" + chr(10) + chr(10) +
+                "Выбери:")
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="timeout", args=args, success=True)
+
+    async def _agentic_timeout_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle timeout:<seconds> callback buttons."""
+        query = update.callback_query
+        await query.answer()
+        try:
+            seconds = int(query.data.split(":", 1)[1])
+        except ValueError:
+            await query.message.reply_text("Bad value")
+            return
+        setattr(self.settings, "claude_timeout_seconds", seconds)
+        try:
+            write_env_var("CLAUDE_TIMEOUT_SECONDS", str(seconds))
+        except Exception as e:
+            logger.error("Failed to persist CLAUDE_TIMEOUT_SECONDS", error=str(e))
+        await query.edit_message_text(
+            "Timeout → <b>" + str(seconds) + "</b> сек",
+            parse_mode="HTML",
+        )
+
+    async def agentic_turns(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/turns — picker for Claude max conversation turns."""
+        user_id = update.effective_user.id
+        if context.user_data.get("_invoked_from_menu"):
+            args = []
+        else:
+            args = update.message.text.split()[1:] if update.message.text else []
+        if args:
+            try:
+                turns = int(args[0])
+            except ValueError:
+                await update.message.reply_text("Передай число, например /turns 200")
+                return
+            if turns < 1 or turns > 2000:
+                await update.message.reply_text("Диапазон: 1 — 2000.")
+                return
+            setattr(self.settings, "claude_max_turns", turns)
+            try:
+                write_env_var("CLAUDE_MAX_TURNS", str(turns))
+            except Exception as e:
+                logger.error("Failed to persist CLAUDE_MAX_TURNS", error=str(e))
+            await update.message.reply_text(
+                "Max turns → <b>" + str(turns) + "</b>",
+                parse_mode="HTML",
+            )
+            return
+        current = self.settings.claude_max_turns
+        rows = []
+        for v, label in self._TURNS_OPTIONS:
+            marker = " ✓" if v == current else ""
+            rows.append([InlineKeyboardButton(label + marker, callback_data="turns:" + str(v))])
+        keyboard = InlineKeyboardMarkup(rows)
+        text = ("<b>🔁 Max turns</b>" + chr(10) + chr(10) +
+                "Текущее: <b>" + str(current) + "</b>" + chr(10) + chr(10) +
+                "Выбери:")
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(user_id=user_id, command="turns", args=args, success=True)
+
+    async def _agentic_turns_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle turns:<n> callback buttons."""
+        query = update.callback_query
+        await query.answer()
+        try:
+            turns = int(query.data.split(":", 1)[1])
+        except ValueError:
+            await query.message.reply_text("Bad value")
+            return
+        setattr(self.settings, "claude_max_turns", turns)
+        try:
+            write_env_var("CLAUDE_MAX_TURNS", str(turns))
+        except Exception as e:
+            logger.error("Failed to persist CLAUDE_MAX_TURNS", error=str(e))
+        await query.edit_message_text(
+            "Max turns → <b>" + str(turns) + "</b>",
+            parse_mode="HTML",
+        )
+
     async def _handle_env_wizard_input(
         self,
         update: Update,
@@ -2353,6 +2518,8 @@ class MessageOrchestrator:
             f"🤖 Agentic mode: {settings.agentic_mode}",
             f"🧬 Model: <code>{escape_html(str(settings.claude_model or '—'))}</code>",
             f"🧠 Thinking: <b>{settings.claude_thinking_effort}</b>",
+            f"⏱ Timeout: <b>{settings.claude_timeout_seconds}</b>s",
+            f"🔁 Max turns: <b>{settings.claude_max_turns}</b>",
             f"📢 Verbose: <b>{verbose_level}</b> ({verbose_label})",
             f"🎤 Voice: {voice_line}",
             f"🔑 User env vars: <b>{env_count}</b>",
@@ -2372,6 +2539,10 @@ class MessageOrchestrator:
                 [
                     InlineKeyboardButton("🧬 Модель", callback_data="menu:model"),
                     InlineKeyboardButton("🧠 Thinking", callback_data="menu:thinking"),
+                ],
+                [
+                    InlineKeyboardButton("⏱ Timeout", callback_data="menu:timeout"),
+                    InlineKeyboardButton("🔁 Turns", callback_data="menu:turns"),
                 ],
             ]
         )
