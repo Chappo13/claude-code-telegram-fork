@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -2020,6 +2020,60 @@ class MessageOrchestrator:
 
     # --- /env wizard ---
 
+    def _env_list_view(
+        self, show_protected: bool = False
+    ) -> Tuple[str, InlineKeyboardMarkup]:
+        """Build the shared text + keyboard for the /env list screen.
+
+        Protected keys are collapsed under a single expander row by default —
+        they can't be edited from the bot, so listing each one wastes screen.
+        """
+        rows = list_user_keys()
+        all_env = read_env_file()
+        editable_keys = [k for k, _ in rows]
+        protected_present = sorted(k for k in all_env.keys() if k in PROTECTED_KEYS)
+
+        lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
+        if not editable_keys and not protected_present:
+            lines.append("<i>Пока ничего не добавлено.</i>")
+        else:
+            lines.append("Тапни ключ — увидишь значение и сможешь заменить/удалить.")
+            if protected_present and show_protected:
+                lines.append("")
+                lines.append("🔒 — защищённые, только просмотр.")
+
+        keyboard_rows: List[List[InlineKeyboardButton]] = []
+        for key in editable_keys:
+            keyboard_rows.append([
+                InlineKeyboardButton("🔑 " + key, callback_data="env:k:" + key),
+            ])
+        if protected_present:
+            if show_protected:
+                for key in protected_present:
+                    keyboard_rows.append([
+                        InlineKeyboardButton("🔒 " + key, callback_data="env:k:" + key),
+                    ])
+                keyboard_rows.append([
+                    InlineKeyboardButton(
+                        "🔼 Скрыть защищённые", callback_data="env:phd"
+                    ),
+                ])
+            else:
+                keyboard_rows.append([
+                    InlineKeyboardButton(
+                        f"🔒 Защищённые ({len(protected_present)}) ▾",
+                        callback_data="env:psh",
+                    ),
+                ])
+        keyboard_rows.append([
+            InlineKeyboardButton("➕ Добавить новый", callback_data="env:add"),
+        ])
+        keyboard_rows.append([
+            InlineKeyboardButton("◀ В меню", callback_data="env:menu"),
+            InlineKeyboardButton("✖ Скрыть", callback_data="env:close"),
+        ])
+        return "\n".join(lines), InlineKeyboardMarkup(keyboard_rows)
+
     async def agentic_env(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -2033,44 +2087,9 @@ class MessageOrchestrator:
                 parse_mode="HTML",
             )
             return
-        rows = list_user_keys()
-        all_env = read_env_file()
-        # Build full list: user keys (editable) + protected keys (read-only display).
-        editable_keys = [k for k, _ in rows]
-        protected_present = sorted(k for k in all_env.keys() if k in PROTECTED_KEYS)
-
-        lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
-        if not editable_keys and not protected_present:
-            lines.append("<i>Пока ничего не добавлено.</i>")
-        else:
-            lines.append("Тапни ключ — увидишь значение и сможешь заменить/удалить.")
-            if protected_present:
-                lines.append("")
-                lines.append("🔒 — защищённые, только просмотр.")
-
-        keyboard_rows: List[List[InlineKeyboardButton]] = []
-        # Editable keys first.
-        for key in editable_keys:
-            keyboard_rows.append([
-                InlineKeyboardButton(
-                    "🔑 " + key,
-                    callback_data="env:k:" + key,
-                ),
-            ])
-        # Protected (read-only).
-        for key in protected_present:
-            keyboard_rows.append([
-                InlineKeyboardButton(
-                    "🔒 " + key,
-                    callback_data="env:k:" + key,
-                ),
-            ])
-        keyboard_rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data="env:add")])
-        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        text, keyboard = self._env_list_view(show_protected=False)
         await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=keyboard,
+            text, parse_mode="HTML", reply_markup=keyboard,
         )
 
         audit_logger = context.bot_data.get("audit_logger")
@@ -2113,6 +2132,32 @@ class MessageOrchestrator:
             return
         if action == "back":
             await self._env_back_to_list(update, context)
+            return
+        if action == "psh":
+            await self._env_back_to_list(update, context, show_protected=True)
+            return
+        if action == "phd":
+            await self._env_back_to_list(update, context, show_protected=False)
+            return
+        if action == "close":
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        if action == "menu":
+            # Drop keyboard on the /env message, then open main /settings as a new message.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            fake_update = Update(update_id=update.update_id, message=query.message)
+            fake_update._effective_user = query.from_user  # type: ignore[attr-defined]
+            context.user_data["_invoked_from_menu"] = True
+            try:
+                await self.agentic_settings(fake_update, context)
+            finally:
+                context.user_data.pop("_invoked_from_menu", None)
             return
 
         if action == "add":
@@ -2291,32 +2336,14 @@ class MessageOrchestrator:
         )
 
     async def _env_back_to_list(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+        show_protected: bool = False,
     ) -> None:
         """Re-render the /env list in place of the detail message."""
         query = update.callback_query
-        rows = list_user_keys()
-        all_env = read_env_file()
-        editable_keys = [k for k, _ in rows]
-        protected_present = sorted(k for k in all_env.keys() if k in PROTECTED_KEYS)
-        lines: List[str] = ["<b>🔑 Переменные окружения</b>", ""]
-        if not editable_keys and not protected_present:
-            lines.append("<i>Пока ничего не добавлено.</i>")
-        else:
-            lines.append("Тапни ключ — увидишь значение и сможешь заменить/удалить.")
-            if protected_present:
-                lines.append("")
-                lines.append("🔒 — защищённые, только просмотр.")
-        keyboard_rows: List[List[InlineKeyboardButton]] = []
-        for k in editable_keys:
-            keyboard_rows.append([InlineKeyboardButton("🔑 " + k, callback_data="env:k:" + k)])
-        for k in protected_present:
-            keyboard_rows.append([InlineKeyboardButton("🔒 " + k, callback_data="env:k:" + k)])
-        keyboard_rows.append([InlineKeyboardButton("➕ Добавить новый", callback_data="env:add")])
+        text, keyboard = self._env_list_view(show_protected=show_protected)
         await query.edit_message_text(
-            chr(10).join(lines),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            text, parse_mode="HTML", reply_markup=keyboard,
         )
 
     # --- /model and /thinking ---
