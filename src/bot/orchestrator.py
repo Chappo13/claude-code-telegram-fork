@@ -45,6 +45,12 @@ from .env_manager import (
 )
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
+from .utils.file_extractor import (
+    AudioAttachment,
+    FileAttachment,
+    validate_audio_path,
+    validate_file_path,
+)
 from .utils.image_extractor import (
     ImageAttachment,
     should_send_as_photo,
@@ -863,6 +869,8 @@ class MessageOrchestrator:
         start_time: float,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
         mcp_images: Optional[List[ImageAttachment]] = None,
+        mcp_files: Optional[List[FileAttachment]] = None,
+        mcp_audios: Optional[List[AudioAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
         interrupt_event: Optional[asyncio.Event] = None,
@@ -881,7 +889,9 @@ class MessageOrchestrator:
         collection or draft streaming is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
-        need_mcp_intercept = mcp_images is not None and approved_directory is not None
+        need_mcp_intercept = approved_directory is not None and (
+            mcp_images is not None or mcp_files is not None or mcp_audios is not None
+        )
 
         if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
             return None
@@ -893,23 +903,45 @@ class MessageOrchestrator:
             if interrupt_event is not None and interrupt_event.is_set():
                 return
 
-            # Intercept send_image_to_user MCP tool calls.
-            # The SDK namespaces MCP tools as "mcp__<server>__<tool>",
-            # so match both the bare name and the namespaced variant.
+            # Intercept send_image_to_user / send_file_to_user / send_audio_to_user.
+            # The SDK namespaces MCP tools as "mcp__<server>__<tool>", so match
+            # both the bare name and the namespaced variant.
             if update_obj.tool_calls and need_mcp_intercept:
                 for tc in update_obj.tool_calls:
                     tc_name = tc.get("name", "")
-                    if tc_name == "send_image_to_user" or tc_name.endswith(
-                        "__send_image_to_user"
+                    tc_input = tc.get("input", {}) or {}
+                    file_path = tc_input.get("file_path", "")
+                    caption = tc_input.get("caption", "")
+                    if mcp_images is not None and (
+                        tc_name == "send_image_to_user"
+                        or tc_name.endswith("__send_image_to_user")
                     ):
-                        tc_input = tc.get("input", {})
-                        file_path = tc_input.get("file_path", "")
-                        caption = tc_input.get("caption", "")
                         img = validate_image_path(
                             file_path, approved_directory, caption
                         )
                         if img:
                             mcp_images.append(img)
+                    elif mcp_files is not None and (
+                        tc_name == "send_file_to_user"
+                        or tc_name.endswith("__send_file_to_user")
+                    ):
+                        f = validate_file_path(
+                            file_path, approved_directory, caption
+                        )
+                        if f:
+                            mcp_files.append(f)
+                    elif mcp_audios is not None and (
+                        tc_name == "send_audio_to_user"
+                        or tc_name.endswith("__send_audio_to_user")
+                    ):
+                        a = validate_audio_path(
+                            file_path,
+                            approved_directory,
+                            caption,
+                            bool(tc_input.get("as_voice", False)),
+                        )
+                        if a:
+                            mcp_audios.append(a)
 
             # Capture tool calls
             if update_obj.tool_calls:
@@ -1054,6 +1086,65 @@ class MessageOrchestrator:
 
         return caption_sent
 
+    async def _send_files(
+        self,
+        update: Update,
+        files: List[FileAttachment],
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        """Send files collected from send_file_to_user as Telegram documents."""
+        import asyncio as _asyncio
+
+        for f in files[:10]:
+            try:
+                with open(f.path, "rb") as fh:
+                    await update.message.reply_document(
+                        document=fh,
+                        filename=f.path.name,
+                        caption=f.original_reference[:1024] if f.original_reference else None,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                await _asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(
+                    "Failed to send MCP file",
+                    path=str(f.path),
+                    error=str(e),
+                )
+
+    async def _send_audios(
+        self,
+        update: Update,
+        audios: List[AudioAttachment],
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        """Send audio from send_audio_to_user via reply_audio or reply_voice."""
+        import asyncio as _asyncio
+
+        for a in audios[:10]:
+            try:
+                with open(a.path, "rb") as fh:
+                    caption = a.original_reference[:1024] if a.original_reference else None
+                    if a.as_voice:
+                        await update.message.reply_voice(
+                            voice=fh,
+                            caption=caption,
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                    else:
+                        await update.message.reply_audio(
+                            audio=fh,
+                            caption=caption,
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                await _asyncio.sleep(0.4)
+            except Exception as e:
+                logger.warning(
+                    "Failed to send MCP audio",
+                    path=str(a.path),
+                    error=str(e),
+                )
+
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -1124,6 +1215,8 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        mcp_files: List[FileAttachment] = []
+        mcp_audios: List[AudioAttachment] = []
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -1143,6 +1236,8 @@ class MessageOrchestrator:
             start_time,
             reply_markup=stop_kb,
             mcp_images=mcp_images,
+            mcp_files=mcp_files,
+            mcp_audios=mcp_audios,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
             interrupt_event=interrupt_event,
@@ -1296,6 +1391,26 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+        # MCP-collected files / audios — always delivered, regardless of caption_sent.
+        if mcp_files:
+            try:
+                await self._send_files(
+                    update,
+                    mcp_files,
+                    reply_to_message_id=update.message.message_id,
+                )
+            except Exception as f_err:
+                logger.warning("MCP file send failed", error=str(f_err))
+        if mcp_audios:
+            try:
+                await self._send_audios(
+                    update,
+                    mcp_audios,
+                    reply_to_message_id=update.message.message_id,
+                )
+            except Exception as a_err:
+                logger.warning("MCP audio send failed", error=str(a_err))
+
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
         if audit_logger:
@@ -1393,12 +1508,16 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_doc: List[ImageAttachment] = []
+        mcp_files_doc: List[FileAttachment] = []
+        mcp_audios_doc: List[AudioAttachment] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
             time.time(),
             mcp_images=mcp_images_doc,
+                mcp_files=mcp_files_doc,
+                mcp_audios=mcp_audios_doc,
             approved_directory=self.settings.approved_directory,
         )
 
@@ -1476,6 +1595,26 @@ class MessageOrchestrator:
                         )
                     except Exception as img_err:
                         logger.warning("Image send failed", error=str(img_err))
+
+            # MCP-collected files / audios — always delivered, regardless of caption_sent.
+            if mcp_files_doc:
+                try:
+                    await self._send_files(
+                        update,
+                        mcp_files_doc,
+                        reply_to_message_id=update.message.message_id,
+                    )
+                except Exception as f_err:
+                    logger.warning("MCP file send failed", error=str(f_err))
+            if mcp_audios_doc:
+                try:
+                    await self._send_audios(
+                        update,
+                        mcp_audios_doc,
+                        reply_to_message_id=update.message.message_id,
+                    )
+                except Exception as a_err:
+                    logger.warning("MCP audio send failed", error=str(a_err))
 
         except Exception as e:
             from .handlers.message import _format_error_message
@@ -1602,12 +1741,16 @@ class MessageOrchestrator:
         verbose_level = self._get_verbose_level(context)
         tool_log: List[Dict[str, Any]] = []
         mcp_images_media: List[ImageAttachment] = []
+        mcp_files_media: List[FileAttachment] = []
+        mcp_audios_media: List[AudioAttachment] = []
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
             time.time(),
             mcp_images=mcp_images_media,
+                mcp_files=mcp_files_media,
+                mcp_audios=mcp_audios_media,
             approved_directory=self.settings.approved_directory,
         )
 
@@ -1686,6 +1829,26 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # MCP-collected files / audios — always delivered, regardless of caption_sent.
+        if mcp_files_media:
+            try:
+                await self._send_files(
+                    update,
+                    mcp_files_media,
+                    reply_to_message_id=update.message.message_id,
+                )
+            except Exception as f_err:
+                logger.warning("MCP file send failed", error=str(f_err))
+        if mcp_audios_media:
+            try:
+                await self._send_audios(
+                    update,
+                    mcp_audios_media,
+                    reply_to_message_id=update.message.message_id,
+                )
+            except Exception as a_err:
+                logger.warning("MCP audio send failed", error=str(a_err))
 
     async def _handle_unknown_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
