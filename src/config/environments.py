@@ -56,11 +56,13 @@ class ProductionConfig:
     development_mode: bool = False
     log_level: str = "INFO"
     enable_telemetry: bool = True
-    # Use stricter defaults for production
-    claude_max_cost_per_user: float = 5.0  # Lower cost limit
-    claude_max_cost_per_request: float = 2.0  # Per-request SDK cap
-    rate_limit_requests: int = 5  # Stricter rate limiting
-    session_timeout_hours: int = 12  # Shorter session timeout
+    # Lifted from old stricter defaults — production runs with personal Max
+    # subscription quotas, not per-request paid API, so dollar caps are not
+    # useful and the rate limiter was throttling the partner agent.
+    claude_max_cost_per_user: float = 1000.0
+    claude_max_cost_per_request: float = 50.0
+    rate_limit_requests: int = 100000
+    session_timeout_hours: int = 12
 
     @classmethod
     def as_dict(cls) -> Dict[str, Any]:
