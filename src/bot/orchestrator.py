@@ -2355,6 +2355,11 @@ class MessageOrchestrator:
         ("claude-haiku-4-5", "Haiku 4.5"),
     ]
 
+    def _allowed_claude_models(self):
+        if getattr(self.settings, "claude_allow_opus", True):
+            return self._CLAUDE_MODELS
+        return [(mid, label) for mid, label in self._CLAUDE_MODELS if "opus" not in mid]
+
     _THINKING_LEVELS = [
         ("low", "Low — минимум"),
         ("medium", "Medium"),
@@ -2379,7 +2384,8 @@ class MessageOrchestrator:
             args = []
         else:
             args = update.message.text.split()[1:] if update.message.text else []
-        valid_ids = {mid for mid, _ in self._CLAUDE_MODELS}
+        models = self._allowed_claude_models()
+        valid_ids = {mid for mid, _ in models}
         if args:
             model_id = args[0].strip()
             if model_id not in valid_ids:
@@ -2395,7 +2401,7 @@ class MessageOrchestrator:
             return
         current = self.settings.claude_model or "не задана"
         rows = []
-        for mid, label in self._CLAUDE_MODELS:
+        for mid, label in models:
             marker = " ✓" if mid == self.settings.claude_model else ""
             rows.append([InlineKeyboardButton(label + marker, callback_data="model:" + mid)])
         keyboard = InlineKeyboardMarkup(rows)
@@ -2414,7 +2420,7 @@ class MessageOrchestrator:
         query = update.callback_query
         await query.answer()
         model_id = query.data.split(":", 1)[1]
-        valid_ids = {mid for mid, _ in self._CLAUDE_MODELS}
+        valid_ids = {mid for mid, _ in self._allowed_claude_models()}
         if model_id not in valid_ids:
             await query.message.reply_text("Неизвестная модель.")
             return

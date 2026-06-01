@@ -82,6 +82,10 @@ class Settings(BaseSettings):
         "claude-opus-4-8",
         description="Claude model to use (defaults to Opus 4.8)",
     )
+    claude_allow_opus: bool = Field(
+        True,
+        description="If False, /model picker excludes Opus variants. Used to ring-fence Opus quota for the primary user when a partner shares the subscription.",
+    )
     claude_thinking_effort: Literal["low", "medium", "high", "xhigh"] = Field(
         "xhigh",
         description=(
